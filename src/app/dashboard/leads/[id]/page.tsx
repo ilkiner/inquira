@@ -4,13 +4,20 @@ import { z } from "zod";
 import { getStore } from "@/lib/store";
 import { STAGES } from "@/lib/types";
 import { markRead, sendStaffReply, setMode, setStage } from "../../actions";
-import { ScoreBar, StageBadge } from "../../ui";
+import { ChannelBadge, ScoreBar, StageBadge } from "../../ui";
 import { AutoRefresh } from "./auto-refresh";
 
 export const dynamic = "force-dynamic";
 
-export default async function LeadPage({ params }: { params: Promise<{ id: string }> }) {
+export default async function LeadPage({
+  params,
+  searchParams,
+}: {
+  params: Promise<{ id: string }>;
+  searchParams: Promise<{ sendError?: string }>;
+}) {
   const { id } = await params;
+  const { sendError } = await searchParams;
   if (!z.uuid().safeParse(id).success) notFound();
 
   const store = getStore();
@@ -42,6 +49,7 @@ export default async function LeadPage({ params }: { params: Promise<{ id: strin
               ← Leads
             </Link>
             <h1 className="font-semibold">{lead.name ?? "Anonymous visitor"}</h1>
+            <ChannelBadge channel={lead.channel} />
           </div>
           <form action={setMode.bind(null, id, lead.mode === "ai" ? "human" : "ai")}>
             <button
@@ -80,6 +88,12 @@ export default async function LeadPage({ params }: { params: Promise<{ id: strin
           ))}
         </div>
 
+        {sendError && (
+          <p className="border-t border-red-100 bg-red-50 px-4 py-2 text-sm text-red-700">
+            Saved, but WhatsApp didn&apos;t deliver it. If the patient&apos;s last message is older than 24 hours,
+            WhatsApp only allows approved template messages — contact them from the WhatsApp app instead.
+          </p>
+        )}
         <form action={sendStaffReply.bind(null, id)} className="flex items-end gap-2 border-t border-slate-100 p-3">
           <textarea
             name="text"

@@ -1,19 +1,26 @@
 import "server-only";
+import postgres from "postgres";
 import { memoryStore } from "./memory";
-import { createSupabaseStore } from "./supabase";
+import { createPostgresStore } from "./postgres";
 import type { Store } from "./types";
 
 let store: Store | undefined;
 
-// Supabase when configured, otherwise an in-memory store for local demos.
+// Postgres when DATABASE_URL is set (Neon, Supabase, any host), otherwise an
+// in-memory store for local demos.
 export function getStore(): Store {
   if (store) return store;
-  const url = process.env.SUPABASE_URL;
-  const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
-  store = url && key ? createSupabaseStore(url, key) : memoryStore;
+  const url = process.env.DATABASE_URL;
+  if (!url) return (store = memoryStore);
+
+  // `prepare: false` keeps it compatible with transaction-mode poolers (Neon, PgBouncer).
+  const sql = postgres(url, { max: 5, prepare: false });
+  store = createPostgresStore(
+    (text, params = []) => sql.unsafe(text, params as postgres.ParameterOrJSON<never>[]) as never,
+  );
   return store;
 }
 
-export const usingMemoryStore = () => !(process.env.SUPABASE_URL && process.env.SUPABASE_SERVICE_ROLE_KEY);
+export const usingMemoryStore = () => !process.env.DATABASE_URL;
 
 export type { Store } from "./types";

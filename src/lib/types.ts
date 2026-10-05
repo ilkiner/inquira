@@ -1,12 +1,15 @@
-import type Anthropic from "@anthropic-ai/sdk";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 
-export type ApiMessage = Anthropic.Beta.BetaMessageParam;
+// Stored in the OpenAI chat format, which every supported provider speaks.
+export type ApiMessage = ChatCompletionMessageParam;
 
 export const STAGES = ["new", "qualifying", "qualified", "handoff", "booked", "lost"] as const;
 export type Stage = (typeof STAGES)[number];
 
 // "ai": the assistant answers. "human": a coordinator took over, AI stays silent.
 export type Mode = "ai" | "human";
+
+export type Channel = "web" | "whatsapp";
 
 export type LeadFields = {
   name: string | null;
@@ -23,6 +26,9 @@ export type LeadFields = {
 
 export type Conversation = LeadFields & {
   id: string;
+  channel: Channel;
+  // WhatsApp number (wa_id) for WhatsApp chats; null for web chats.
+  externalUserId: string | null;
   visitorToken: string;
   createdAt: string;
   updatedAt: string;
@@ -31,8 +37,7 @@ export type Conversation = LeadFields & {
   score: number; // 0–100, how likely this lead books
   handoffReason: string | null;
   unreadForStaff: boolean;
-  // Append-only Claude API history. Never rewrite earlier entries: the API
-  // validates thinking blocks against the exact history that produced them.
+  // Append-only model history (without the system prompt, which is added per request).
   apiHistory: ApiMessage[];
 };
 

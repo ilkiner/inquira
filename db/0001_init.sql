@@ -1,9 +1,11 @@
--- Inquira: conversations double as leads.
--- All access goes through the server with the service_role key, so RLS is
--- enabled with no policies: the anon key can read or write nothing.
+-- Inquira schema. Plain PostgreSQL 13+ (Neon, Supabase, RDS, local — any works).
+-- Conversations double as leads.
 
 create table if not exists conversations (
   id uuid primary key default gen_random_uuid(),
+  channel text not null default 'web' check (channel in ('web', 'whatsapp')),
+  -- WhatsApp number (wa_id) for WhatsApp chats.
+  external_user_id text,
   visitor_token uuid not null default gen_random_uuid(),
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
@@ -23,11 +25,13 @@ create table if not exists conversations (
   email text,
   medical_notes text,
   summary text,
-  -- Append-only Claude API message history (never rewritten).
+  -- Append-only model message history (never rewritten).
   api_history jsonb not null default '[]'::jsonb
 );
 
 create index if not exists conversations_updated_at_idx on conversations (updated_at desc);
+create unique index if not exists conversations_external_user_idx
+  on conversations (channel, external_user_id) where external_user_id is not null;
 
 create table if not exists messages (
   id uuid primary key default gen_random_uuid(),
@@ -40,16 +44,8 @@ create table if not exists messages (
 
 create index if not exists messages_conversation_idx on messages (conversation_id, created_at);
 
--- Atomic append so concurrent turns can't overwrite each other's history.
-create or replace function append_api_history(conv_id uuid, entries jsonb)
-returns void
-language sql
-as $$
-  update conversations
-  set api_history = api_history || entries, updated_at = now()
-  where id = conv_id;
-$$;
-
-alter table conversations enable row level security;
-alter table messages enable row level security;
-revoke execute on function append_api_history(uuid, jsonb) from public, anon, authenticated;
+-- Inbound webhook event ids, so retried deliveries are answered only once.
+create table if not exists processed_events (
+  id text primary key,
+  created_at timestamptz not null default now()
+);

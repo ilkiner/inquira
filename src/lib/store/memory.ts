@@ -4,17 +4,27 @@ import type { Store } from "./types";
 
 // Dev/demo store. Data lives in process memory and is lost on restart.
 // Kept on globalThis so Next.js hot reloads don't wipe it.
-type MemoryDb = { conversations: Map<string, Conversation>; messages: DisplayMessage[] };
+type MemoryDb = { conversations: Map<string, Conversation>; messages: DisplayMessage[]; events: Set<string> };
 const g = globalThis as unknown as { __inquiraDb?: MemoryDb };
-const db: MemoryDb = (g.__inquiraDb ??= { conversations: new Map(), messages: [] });
+const db: MemoryDb = (g.__inquiraDb ??= { conversations: new Map(), messages: [], events: new Set() });
 
-const now = () => new Date().toISOString();
+// Strictly increasing timestamps: two writes in the same millisecond must still
+// sort and compare correctly, or "messages after X" polling would skip one.
+let lastMs = 0;
+const now = () => {
+  lastMs = Math.max(Date.now(), lastMs + 1);
+  return new Date(lastMs).toISOString();
+};
 
 export const memoryStore: Store = {
-  async createConversation() {
+  async createConversation(init = {}) {
     const conversation: Conversation = {
       ...EMPTY_LEAD,
+      name: init.name ?? null,
+      whatsapp: init.whatsapp ?? null,
       id: randomUUID(),
+      channel: init.channel ?? "web",
+      externalUserId: init.externalUserId ?? null,
       visitorToken: randomUUID(),
       createdAt: now(),
       updatedAt: now(),
@@ -31,6 +41,13 @@ export const memoryStore: Store = {
 
   async getConversation(id) {
     const c = db.conversations.get(id);
+    return c ? structuredClone(c) : null;
+  },
+
+  async findConversationByExternalUser(channel, externalUserId) {
+    const c = [...db.conversations.values()].find(
+      (x) => x.channel === channel && x.externalUserId === externalUserId,
+    );
     return c ? structuredClone(c) : null;
   },
 
@@ -85,5 +102,11 @@ export const memoryStore: Store = {
     db.messages.forEach((m) => {
       if (set.has(m.id)) m.syncedToAi = true;
     });
+  },
+
+  async claimEvent(id) {
+    if (db.events.has(id)) return false;
+    db.events.add(id);
+    return true;
   },
 };

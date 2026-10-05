@@ -1,5 +1,9 @@
 import "server-only";
-import Anthropic from "@anthropic-ai/sdk";
+import OpenAI from "openai";
+import type {
+  ChatCompletionMessageFunctionToolCall,
+  ChatCompletionToolMessageParam,
+} from "openai/resources/chat/completions";
 import { clinic } from "../clinic-config";
 import { dashboardLink, notifyCoordinator } from "../notify";
 import type { Store } from "../store";
@@ -8,25 +12,32 @@ import type { ApiMessage, Conversation, Stage } from "../types";
 import { SYSTEM_PROMPT } from "./prompt";
 import { handoffInput, TOOLS, updateLeadInput } from "./tools";
 
-export const MODEL = "claude-opus-5-5";
+// Any OpenAI-compatible endpoint works. Defaults to NVIDIA's free NIM API.
+//   NVIDIA:     https://integrate.api.nvidia.com/v1   meta/llama-3.3-70b-instruct
+//   Groq:       https://api.groq.com/openai/v1        llama-3.3-70b-versatile
+//   Gemini:     https://generativelanguage.googleapis.com/v1beta/openai/   gemini-2.5-flash
+//   OpenRouter: https://openrouter.ai/api/v1          (any model with tool support)
+const BASE_URL = process.env.LLM_BASE_URL || "https://integrate.api.nvidia.com/v1";
+export const MODEL = process.env.LLM_MODEL || "meta/llama-3.3-70b-instruct";
 const MAX_TOOL_ROUNDS = 4;
 
 // The subset of the SDK we use, so tests can pass a fake client.
-export type MessagesClient = {
-  beta: { messages: { create: Anthropic["beta"]["messages"]["create"] } };
+export type ChatClient = {
+  chat: { completions: { create: OpenAI["chat"]["completions"]["create"] } };
 };
 
-let defaultClient: Anthropic | undefined;
-const getClient = () => (defaultClient ??= new Anthropic());
+let defaultClient: OpenAI | undefined;
+const getClient = () =>
+  (defaultClient ??= new OpenAI({ baseURL: BASE_URL, apiKey: process.env.LLM_API_KEY, maxRetries: 2 }));
 
-const FALLBACK_REPLY =
+export const FALLBACK_REPLY =
   "Sorry, I couldn't answer that just now. Our coordinator will get back to you shortly.";
 
 type TurnResult = { reply: string; handedOff: boolean };
 
 // One turn at a time per conversation: two concurrent turns would both build on
-// the same history and append interleaved, invalid entries. (Per-process only —
-// run a single instance or move this to a DB advisory lock when scaling out.)
+// the same history and append interleaved entries. (Per-process only — run a
+// single instance or move this to a DB advisory lock when scaling out.)
 const locks = new Map<string, Promise<unknown>>();
 async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const previous = locks.get(key) ?? Promise.resolve();
@@ -43,7 +54,7 @@ export function runAgentTurn(
   store: Store,
   conversationId: string,
   patientText: string,
-  client: MessagesClient = getClient(),
+  client: ChatClient = getClient(),
 ): Promise<TurnResult> {
   return withLock(conversationId, () => runTurnLocked(store, conversationId, patientText, client));
 }
@@ -52,70 +63,70 @@ async function runTurnLocked(
   store: Store,
   conversationId: string,
   patientText: string,
-  client: MessagesClient,
+  client: ChatClient,
 ): Promise<TurnResult> {
   const conversation = await store.getConversation(conversationId);
   if (!conversation) throw new Error(`Conversation ${conversationId} not found`);
 
   // Fold in anything the coordinator wrote while the AI was paused.
   const staffMessages = await store.listUnsyncedStaffMessages(conversationId);
-  const userContent: Anthropic.Beta.BetaContentBlockParam[] = [
-    ...staffMessages.map((m) => ({
-      type: "text" as const,
-      text: `[Coordinator ${clinic.coordinatorName} wrote to the patient: "${m.text}"]`,
-    })),
-    { type: "text", text: patientText },
-  ];
+  const staffNotes = staffMessages.map(
+    (m) => `[Coordinator ${clinic.coordinatorName} wrote to the patient: "${m.text}"]`,
+  );
 
-  const turn: ApiMessage[] = [{ role: "user", content: userContent }];
+  const turn: ApiMessage[] = [{ role: "user", content: [...staffNotes, patientText].join("\n\n") }];
   const replyParts: string[] = [];
   const effects = new TurnEffects(conversation);
 
   try {
     for (let round = 0; round <= MAX_TOOL_ROUNDS; round++) {
-      const response = await client.beta.messages.create({
+      const response = await client.chat.completions.create({
         model: MODEL,
-        max_tokens: 8000,
-        system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
+        messages: [{ role: "system", content: SYSTEM_PROMPT }, ...conversation.apiHistory, ...turn],
         tools: TOOLS,
-        // Caches the conversation so far; each turn only pays for the new part.
-        cache_control: { type: "ephemeral" },
-        messages: [...conversation.apiHistory, ...turn],
-        // Chat needs speed more than deep reasoning.
-        output_config: { effort: "low" },
-        // If the model declines, the API retries on a fallback model in the same call.
-        betas: ["server-side-fallback-2026-07-01"],
-        fallbacks: "default",
+        tool_choice: round < MAX_TOOL_ROUNDS ? "auto" : "none",
+        temperature: 0.4,
+        max_tokens: 1024,
       });
 
-      // Append the assistant content unchanged — required for the next request.
-      turn.push({ role: "assistant", content: response.content as Anthropic.Beta.BetaContentBlockParam[] });
+      const choice = response.choices[0];
+      if (!choice) throw new Error("Empty response from model");
+      const message = choice.message;
+      const toolCalls = (message.tool_calls ?? []).filter(
+        (c): c is ChatCompletionMessageFunctionToolCall => c.type === "function",
+      );
 
-      for (const block of response.content) {
-        if (block.type === "text" && block.text.trim()) replyParts.push(block.text.trim());
-      }
+      turn.push({
+        role: "assistant",
+        content: message.content ?? null,
+        ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
+      });
 
-      if (response.stop_reason === "refusal") {
+      const text = cleanReply(message.content);
+      if (text) replyParts.push(text);
+
+      if (choice.finish_reason === "content_filter") {
         replyParts.length = 0;
         replyParts.push(FALLBACK_REPLY);
-        effects.handoff("The assistant could not answer this message.", "normal");
+        effects.handoff("The AI provider blocked a reply to this message.", "normal");
         break;
       }
 
-      if (response.stop_reason !== "tool_use") break;
+      // Some providers report finish_reason "stop" even with tool calls, so key off the calls.
+      if (toolCalls.length === 0) break;
 
-      const toolResults: Anthropic.Beta.BetaToolResultBlockParam[] = [];
-      for (const block of response.content) {
-        if (block.type !== "tool_use") continue;
-        toolResults.push({ type: "tool_result", tool_use_id: block.id, ...effects.apply(block) });
+      for (const call of toolCalls) {
+        const result: ChatCompletionToolMessageParam = {
+          role: "tool",
+          tool_call_id: call.id,
+          content: effects.apply(call.function.name, call.function.arguments),
+        };
+        turn.push(result);
       }
-      // Tool results are always appended, even if we stop here, so the history
-      // never ends on an unanswered tool_use.
-      turn.push({ role: "user", content: toolResults });
     }
   } catch (err) {
-    // Nothing is appended on failure: the AI history stays consistent and the
-    // staff messages stay unsynced, so the next turn includes them again.
+    // Nothing is appended on failure: the history stays consistent and the staff
+    // messages stay unsynced, so the next turn includes them again.
     console.error("[agent] turn failed", err);
     // The fallback reply promises a human follow-up, so make sure one happens.
     const reason = "The AI assistant was unavailable for this message.";
@@ -135,6 +146,19 @@ async function runTurnLocked(
   return { reply: replyParts.join("\n\n") || FALLBACK_REPLY, handedOff: effects.handedOff };
 }
 
+// Reasoning models (Qwen, DeepSeek…) may leak <think> blocks into the content.
+function cleanReply(content: string | null | undefined): string {
+  return (content ?? "").replace(/<think>[\s\S]*?(<\/think>|$)/gi, "").trim();
+}
+
+function parseArgs(raw: string): unknown {
+  try {
+    return JSON.parse(raw || "{}");
+  } catch {
+    return null;
+  }
+}
+
 // Collects the lead updates and alerts produced by tool calls in one turn and
 // applies them together at the end.
 class TurnEffects {
@@ -150,20 +174,21 @@ class TurnEffects {
     return { ...this.before, ...this.patch } as Conversation;
   }
 
-  apply(block: Anthropic.Beta.BetaToolUseBlock): { content: string; is_error?: boolean } {
-    if (block.name === "update_lead") {
-      const parsed = updateLeadInput.safeParse(block.input);
-      if (!parsed.success) return { content: `Invalid input: ${parsed.error.message}`, is_error: true };
+  apply(name: string, rawArgs: string): string {
+    const args = parseArgs(rawArgs);
+    if (name === "update_lead") {
+      const parsed = updateLeadInput.safeParse(args);
+      if (!parsed.success) return `Error: invalid input (${parsed.error.issues[0]?.message}). Fix and retry.`;
       this.updateLead(parsed.data);
-      return { content: "Saved." };
+      return "Saved.";
     }
-    if (block.name === "handoff_to_coordinator") {
-      const parsed = handoffInput.safeParse(block.input);
-      if (!parsed.success) return { content: `Invalid input: ${parsed.error.message}`, is_error: true };
+    if (name === "handoff_to_coordinator") {
+      const parsed = handoffInput.safeParse(args);
+      if (!parsed.success) return `Error: invalid input (${parsed.error.issues[0]?.message}). Fix and retry.`;
       this.handoff(parsed.data.reason, parsed.data.urgency);
-      return { content: `${clinic.coordinatorName} has been notified.` };
+      return `${clinic.coordinatorName} has been notified.`;
     }
-    return { content: `Unknown tool: ${block.name}`, is_error: true };
+    return `Error: unknown tool ${name}.`;
   }
 
   private updateLead(input: ReturnType<typeof updateLeadInput.parse>) {
@@ -211,7 +236,7 @@ class TurnEffects {
 }
 
 // The AI may move a lead forward or mark it lost, but never undo a handoff or booking.
-function canMoveTo(from: Stage, to: Stage): boolean {
+export function canMoveTo(from: Stage, to: Stage): boolean {
   if (from === to) return false;
   if (from === "booked") return false;
   if (from === "handoff") return to === "booked" || to === "lost";

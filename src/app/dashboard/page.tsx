@@ -38,8 +38,7 @@ export default async function DashboardPage({
 
       {usingMemoryStore() && (
         <p className="mb-4 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800 ring-1 ring-amber-200">
-          Demo mode: data is kept in memory and disappears on restart. Set SUPABASE_URL and
-          SUPABASE_SERVICE_ROLE_KEY to persist it.
+          Demo mode: data is kept in memory and disappears on restart. Set DATABASE_URL to persist it.
         </p>
       )}
 
@@ -67,6 +66,7 @@ export default async function DashboardPage({
                   <p className="truncate text-sm font-medium">
                     {c.unreadForStaff && <span className="me-1.5 inline-block size-2 rounded-full bg-teal-500" />}
                     {c.name ?? "Anonymous visitor"}
+                    {c.channel === "whatsapp" && <span className="ms-1.5 text-xs text-emerald-600">WhatsApp</span>}
                   </p>
                   <p className="truncate text-xs text-slate-500">
                     {[c.country, c.language, c.whatsapp ?? c.email].filter(Boolean).join(" · ") || "—"}

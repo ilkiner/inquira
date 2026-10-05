@@ -1,4 +1,4 @@
-import type { Stage } from "@/lib/types";
+import type { Channel, Stage } from "@/lib/types";
 
 const stageStyles: Record<Stage, string> = {
   new: "bg-slate-100 text-slate-700",
@@ -35,4 +35,14 @@ export function timeAgo(iso: string): string {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
   return `${Math.floor(seconds / 86400)}d`;
+}
+
+export function ChannelBadge({ channel }: { channel: Channel }) {
+  return channel === "whatsapp" ? (
+    <span className="inline-flex rounded-full bg-emerald-50 px-2 py-0.5 text-xs font-medium text-emerald-700">
+      WhatsApp
+    </span>
+  ) : (
+    <span className="inline-flex rounded-full bg-slate-100 px-2 py-0.5 text-xs font-medium text-slate-600">Web</span>
+  );
 }

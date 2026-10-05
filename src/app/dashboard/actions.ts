@@ -14,6 +14,7 @@ import {
 import { allow } from "@/lib/rate-limit";
 import { getStore } from "@/lib/store";
 import { STAGES } from "@/lib/types";
+import { sendWhatsAppText } from "@/lib/whatsapp";
 
 // Server actions are reachable by POST from anywhere, so each one re-checks the
 // session instead of relying on the proxy alone.
@@ -68,10 +69,20 @@ export async function sendStaffReply(conversationId: string, formData: FormData)
   const id = idSchema.parse(conversationId);
   const text = z.string().trim().min(1).max(4000).parse(formData.get("text"));
   const store = getStore();
+  const conversation = await store.getConversation(id);
+  if (!conversation) redirect("/dashboard");
+
   // Writing to the patient implies a human is now handling the chat.
   await store.updateConversation(id, { mode: "human", unreadForStaff: false });
   await store.addMessage(id, "staff", text);
+
+  // Web chats pick the message up by polling; WhatsApp chats need it delivered.
+  if (conversation.channel === "whatsapp" && conversation.externalUserId) {
+    const sent = await sendWhatsAppText(conversation.externalUserId, text);
+    if (!sent.ok) redirect(`/dashboard/leads/${id}?sendError=1`);
+  }
   revalidatePath(`/dashboard/leads/${id}`);
+  redirect(`/dashboard/leads/${id}`);
 }
 
 export async function markRead(conversationId: string) {
